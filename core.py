@@ -205,7 +205,22 @@ def new_match_id() -> str:
     raise RuntimeError("Non riesco a generare un ID libero")
 
 
+MAX_PARTITE_APERTE = 2  # quante partite può tenere aperte una persona sola
+
+
+def open_matches_by(chat_id: int, organizer_id: int):
+    """Le partite ancora aperte organizzate da una certa persona in un gruppo."""
+    return [m for m in open_matches(chat_id) if m["organizer_id"] == organizer_id]
+
+
 def create_match(chat_id, organizer_id, organizer_name, when, place, max_players):
+    sue = open_matches_by(chat_id, organizer_id)
+    if len(sue) >= MAX_PARTITE_APERTE:
+        elenco = ", ".join(f"<code>{m['id']}</code>" for m in sue)
+        raise ParseError(
+            f"Hai già {len(sue)} partite aperte in questo gruppo ({elenco}).\n\n"
+            "Aspetta che si giochino, oppure chiudine una con /annulla o /elimina."
+        )
     if max_players < 2:
         raise ParseError("Servono almeno 2 giocatori.")
     if max_players > 40:

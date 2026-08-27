@@ -61,6 +61,7 @@ HELP = """⚽ <b>Bot Calcetto</b>
 <b>Creare una partita</b>
 <code>/nuova_partita venerdì 19:00 | Campetto Centro | 10</code>
 (data | posto | numero giocatori)
+Puoi averne al massimo due aperte alla volta.
 
 <b>Comandi</b>
 /partite — le partite aperte

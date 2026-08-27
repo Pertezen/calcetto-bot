@@ -42,6 +42,10 @@ amministratore del gruppo; se chi li ha portati si ritira, se ne vanno con lui �
 erano suoi ospiti, e quei posti tornano liberi per gli altri. La numerazione si
 ricompatta a ogni rimozione, così non restano buchi.
 
+**Limite:** una persona può tenere aperte al massimo **2 partite per gruppo**
+(`core.MAX_PARTITE_APERTE`). Il conto scende da solo quando una partita viene
+giocata, annullata o eliminata.
+
 **Squadre:** premendo 🎽 si sceglie fra sorteggio e composizione manuale. Nel
 secondo caso il bot propone una divisione a caso e la si aggiusta toccando i
 nomi: chi è ⚪ va coi Bianchi, gli altri sono i Neri. La selezione vive nei
