@@ -242,8 +242,14 @@ async def notify(update, context, text, seconds=EPHEMERAL_SECONDS,
     if drop_command and msg:
         try:
             await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
-        except Exception:
-            pass  # il bot non è admin: il comando resta lì
+        except Exception as e:
+            # Quasi sempre: il bot non è amministratore, o gli manca il permesso
+            # di eliminare i messaggi. Lo scrivo nei log, così si capisce perché
+            # il comando sbagliato è rimasto lì.
+            log.warning(
+                "Non riesco a cancellare il comando in %s: %s "
+                "(serve il permesso «Elimina messaggi»)", chat.id, e
+            )
 
     try:
         await context.bot.send_message(
