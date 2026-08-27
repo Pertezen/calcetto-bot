@@ -26,6 +26,8 @@ squadre - Dividi le squadre
 modifica - Cambia ora, posto o posti
 annulla - Annulla la partita
 elimina - Cancella la partita del tutto
+amico - Porti un amico
+togli_amico - Togli un amico
 ```
 
 ## 02 · Prova sul PC (5 min, PowerShell)

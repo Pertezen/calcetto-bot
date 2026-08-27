@@ -4,6 +4,7 @@ Avvio: python bot.py
 """
 
 import asyncio
+import difflib
 import html
 import logging
 import os
@@ -13,13 +14,15 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.constants import ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import core
@@ -40,6 +43,18 @@ PORT = int(os.environ.get("PORT", 8080))
 PURGE_AFTER_HOURS = int(os.environ.get("PURGE_AFTER_HOURS", 3))
 PURGE_EVERY_SECONDS = 600
 
+# Quanto resta a video un avviso scritto nel gruppo prima di autocancellarsi.
+EPHEMERAL_SECONDS = 25
+
+# Tutti i comandi che il bot conosce, per suggerire quello giusto a chi sbaglia.
+COMANDI = [
+    "start", "help", "aiuto", "nuova_partita", "nuova", "iscrivimi", "ci_sono",
+    "esco", "cancella_iscrizione", "lista", "chi_gioca", "partite",
+    "partite_aperte", "squadre", "modifica", "annulla", "cancella_partita",
+    "elimina", "elimina_partita", "amico", "porto_un_amico", "togli_amico",
+    "tolgo_un_amico",
+]
+
 HELP = """⚽ <b>Bot Calcetto</b>
 
 <b>Creare una partita</b>
@@ -51,6 +66,8 @@ HELP = """⚽ <b>Bot Calcetto</b>
 /lista <code>ID</code> — chi gioca
 /iscrivimi <code>ID</code> — ti iscrivi
 /esco <code>ID</code> — ti ritiri
+/amico <code>ID</code> — porti un amico (quanti vuoi)
+/togli_amico <code>ID</code> — ne togli uno
 /squadre <code>ID</code> — divide le squadre (solo organizzatore)
 /modifica <code>ID ora|posto|posti valore</code>
 /annulla <code>ID</code> — annulla la partita, la scheda resta
@@ -59,7 +76,9 @@ HELP = """⚽ <b>Bot Calcetto</b>
 Le partite spariscono da sole 3 ore dopo l'orario di inizio.
 
 Il modo più veloce resta comunque premere i bottoni sotto alla partita.
-Se c'è una sola partita aperta, l'ID puoi anche non scriverlo."""
+Se c'è una sola partita aperta, l'ID puoi anche non scriverlo.
+
+<i>Errori e avvisi te li mando qui in privato, per non intasare il gruppo.</i>"""
 
 
 # --------------------------------------------------------------------------
@@ -92,7 +111,7 @@ def render_card(match) -> tuple[str, InlineKeyboardMarkup | None]:
 
     if starters:
         for i, s in enumerate(starters, 1):
-            lines.append(f"{i}. {esc(s['name'])}")
+            lines.append(f"{i}. {esc(s['label'])}")
     else:
         lines.append("<i>Ancora nessuno. Rompi il ghiaccio.</i>")
 
@@ -100,7 +119,7 @@ def render_card(match) -> tuple[str, InlineKeyboardMarkup | None]:
         lines.append("")
         lines.append("<b>Riserve</b>")
         for i, s in enumerate(reserves, 1):
-            lines.append(f"{i}. {esc(s['name'])}")
+            lines.append(f"{i}. {esc(s['label'])}")
 
     if match["teams"]:
         team_a, team_b = match["teams"].split("||")
@@ -128,6 +147,10 @@ def render_card(match) -> tuple[str, InlineKeyboardMarkup | None]:
         [
             InlineKeyboardButton("✅ Ci sono", callback_data=f"join:{match['id']}"),
             InlineKeyboardButton("🚪 Mi ritiro", callback_data=f"leave:{match['id']}"),
+        ],
+        [
+            InlineKeyboardButton("➕ Porto un amico", callback_data=f"guest:{match['id']}"),
+            InlineKeyboardButton("➖ Tolgo un amico", callback_data=f"unguest:{match['id']}"),
         ],
         [
             InlineKeyboardButton("🎽 Fai le squadre", callback_data=f"teams:{match['id']}"),
@@ -188,6 +211,62 @@ async def retire_card(bot, match, nota: str):
 # Helper
 # --------------------------------------------------------------------------
 
+async def _delete_later(bot, chat_id, message_id, seconds):
+    """Cancella un messaggio dopo un po'. Se fallisce, pazienza."""
+    await asyncio.sleep(seconds)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def notify(update, context, text, seconds=EPHEMERAL_SECONDS,
+                 drop_command=True, keyboard=None):
+    """
+    Avviso destinato a una persona sola.
+
+    Telegram non sa mostrare un messaggio a un solo membro di un gruppo, quindi:
+    in chat privata risponde e basta; nel gruppo prova a scrivere in privato a
+    chi ha lanciato il comando e, se quella persona non ha mai aperto una chat
+    col bot, scrive nel gruppo un messaggio che si cancella da solo. Il comando
+    che ha causato l'avviso sparisce, se il bot ha i permessi per farlo.
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    user = update.effective_user
+
+    if chat.type == ChatType.PRIVATE:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    if drop_command and msg:
+        try:
+            await context.bot.delete_message(chat_id=chat.id, message_id=msg.message_id)
+        except Exception:
+            pass  # il bot non è admin: il comando resta lì
+
+    try:
+        await context.bot.send_message(
+            chat_id=user.id, text=text, parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+    except (Forbidden, BadRequest):
+        pass  # non ha mai avviato il bot in privato: si ripiega sul gruppo
+
+    mention = f'<a href="tg://user?id={user.id}">{esc(display_name(user))}</a>'
+    sent = await context.bot.send_message(
+        chat_id=chat.id,
+        text=f"{mention} {text}\n\n<i>Aprendo una chat privata col bot, "
+             f"questi avvisi arrivano lì.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    asyncio.create_task(
+        _delete_later(context.bot, chat.id, sent.message_id, seconds)
+    )
+
+
 async def resolve_match(update: Update, context, args):
     """
     Trova la partita dall'ID passato come argomento.
@@ -197,7 +276,8 @@ async def resolve_match(update: Update, context, args):
     if args:
         match = core.get_match(args[0])
         if not match or match["chat_id"] != chat_id:
-            await update.effective_message.reply_text(
+            await notify(
+                update, context,
                 f"Non trovo la partita {core.normalize_id(args[0])}."
             )
             return None
@@ -207,16 +287,26 @@ async def resolve_match(update: Update, context, args):
     if len(aperte) == 1:
         return aperte[0]
     if not aperte:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             "Non c'è nessuna partita aperta. Creane una con /nuova_partita."
         )
     else:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             "Ci sono più partite aperte, dimmi quale (es. <code>/lista CALC-1234</code>).\n"
             "Vedi la lista con /partite.",
-            parse_mode=ParseMode.HTML,
         )
     return None
+
+
+async def is_group_admin(context, chat_id, user_id) -> bool:
+    """True se la persona è admin o creatore del gruppo."""
+    try:
+        membro = await context.bot.get_chat_member(chat_id, user_id)
+        return getattr(membro, "status", "") in ("administrator", "creator")
+    except Exception:
+        return False
 
 
 def display_name(user) -> str:
@@ -228,7 +318,7 @@ def display_name(user) -> str:
 # --------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(HELP, parse_mode=ParseMode.HTML)
+    await notify(update, context, HELP, seconds=60)
 
 
 async def cmd_nuova(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,11 +326,11 @@ async def cmd_nuova(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = [p.strip() for p in raw.split("|")]
 
     if len(parts) != 3:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             "Mi servono tre cose separate da <code>|</code>:\n\n"
             "<code>/nuova_partita venerdì 19:00 | Campetto Centro | 10</code>\n\n"
             "Per la data va bene anche <code>domani 21:00</code> o <code>30/08 19:00</code>.",
-            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -262,7 +352,8 @@ async def cmd_nuova(update: Update, context: ContextTypes.DEFAULT_TYPE):
             max_players=max_players,
         )
     except ParseError as e:
-        await update.effective_message.reply_text(str(e), parse_mode=ParseMode.HTML)
+        avevi = f"\n\nAvevi scritto: <code>{esc(raw)}</code>" if raw else ""
+        await notify(update, context, f"{e}{avevi}")
         return
 
     match = core.get_match(match_id)
@@ -310,7 +401,8 @@ async def cmd_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_partite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     aperte = core.open_matches(update.effective_chat.id)
     if not aperte:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             "Nessuna partita in programma. Creane una con /nuova_partita."
         )
         return
@@ -338,12 +430,12 @@ async def cmd_squadre(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_modifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             "Come si usa:\n"
             "<code>/modifica CALC-1234 ora venerdì 20:30</code>\n"
             "<code>/modifica CALC-1234 posto Campetto Nord</code>\n"
             "<code>/modifica CALC-1234 posti 12</code>",
-            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -357,16 +449,16 @@ async def cmd_modifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
         field, value = args[0].lower(), " ".join(args[1:])
 
     if match["chat_id"] != update.effective_chat.id:
-        await update.effective_message.reply_text("Quella partita non è di questo gruppo.")
+        await notify(update, context, "Quella partita non è di questo gruppo.")
         return
     if update.effective_user.id != match["organizer_id"]:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             f"Solo {esc(match['organizer_name'])} può modificare questa partita.",
-            parse_mode=ParseMode.HTML,
         )
         return
     if not value:
-        await update.effective_message.reply_text("Manca il nuovo valore.")
+        await notify(update, context, "Manca il nuovo valore.")
         return
 
     try:
@@ -383,15 +475,13 @@ async def cmd_modifica(update: Update, context: ContextTypes.DEFAULT_TYPE):
             core.update_match(match["id"], max_players=n)
             conferma = f"👥 Ora si gioca in {n}"
         else:
-            await update.effective_message.reply_text(
+            await notify(
+                update, context,
                 "Posso cambiare <code>ora</code>, <code>posto</code> o <code>posti</code>.",
-                parse_mode=ParseMode.HTML,
             )
             return
     except (ParseError, ValueError) as e:
-        await update.effective_message.reply_text(
-            str(e) or "Valore non valido.", parse_mode=ParseMode.HTML
-        )
+        await notify(update, context, str(e) or "Valore non valido.")
         return
 
     updated = core.get_match(match["id"])
@@ -407,9 +497,9 @@ async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not match:
         return
     if update.effective_user.id != match["organizer_id"]:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             f"Solo {esc(match['organizer_name'])} può annullare questa partita.",
-            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -418,7 +508,7 @@ async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await refresh_card(context, updated)
 
     iscritti = core.get_signups(match["id"])
-    menzioni = ", ".join(esc(s["name"]) for s in iscritti) or "nessuno"
+    menzioni = ", ".join(esc(s["label"]) for s in iscritti) or "nessuno"
     await update.effective_message.reply_text(
         f"❌ Partita <code>{match['id']}</code> annullata.\nAvvisati: {menzioni}",
         parse_mode=ParseMode.HTML,
@@ -428,24 +518,25 @@ async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_elimina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancellazione definitiva. L'ID va scritto: è un'operazione senza ritorno."""
     if not context.args:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             "Dimmi quale partita eliminare: <code>/elimina CALC-1234</code>\n\n"
             "Spariscono partita, iscritti e scheda, senza lasciare traccia. "
             "Se vuoi solo fermarla avvisando chi si era iscritto, usa /annulla.",
-            parse_mode=ParseMode.HTML,
         )
         return
 
     match = core.get_match(context.args[0])
     if not match or match["chat_id"] != update.effective_chat.id:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             f"Non trovo la partita {core.normalize_id(context.args[0])}."
         )
         return
     if update.effective_user.id != match["organizer_id"]:
-        await update.effective_message.reply_text(
+        await notify(
+            update, context,
             f"Solo {esc(match['organizer_name'])} può eliminare questa partita.",
-            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -455,12 +546,39 @@ async def cmd_elimina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     core.delete_match(match["id"])
 
-    menzioni = ", ".join(esc(s["name"]) for s in iscritti) or "nessuno"
+    menzioni = ", ".join(esc(s["label"]) for s in iscritti) or "nessuno"
     await update.effective_message.reply_text(
         f"🗑 Partita <code>{match['id']}</code> eliminata.\n"
         f"Erano iscritti: {menzioni}",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_sconosciuto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando che non esiste. Invece di far finta di niente, suggerisce quello
+    giusto — e lo fa in privato, così il gruppo non se ne accorge.
+    """
+    primo = (update.effective_message.text or "").split()
+    if not primo:
+        return
+    nome, _, destinatario = primo[0].lstrip("/").partition("@")
+    if destinatario and destinatario.lower() != (context.bot.username or "").lower():
+        return  # comando rivolto a un altro bot del gruppo
+    nome = nome.lower()
+
+    vicini = difflib.get_close_matches(nome, COMANDI, n=1, cutoff=0.55)
+    if vicini:
+        testo = (
+            f"Non conosco <code>/{esc(nome)}</code>. "
+            f"Forse volevi <code>/{vicini[0]}</code>?"
+        )
+    else:
+        testo = (
+            f"Non conosco <code>/{esc(nome)}</code>. "
+            f"L'elenco dei comandi è in /start."
+        )
+    await notify(update, context, testo)
 
 
 # --------------------------------------------------------------------------
@@ -504,58 +622,81 @@ async def on_shutdown(app):
         task.cancel()
 
 
+async def cmd_amico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = await resolve_match(update, context, context.args)
+    if not match:
+        return
+    await do_amico(update, context, match, update.effective_user)
+
+
+async def cmd_togli_amico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = await resolve_match(update, context, context.args)
+    if not match:
+        return
+    await do_togli_amico(update, context, match, update.effective_user)
+
+
 # --------------------------------------------------------------------------
 # Azioni condivise fra comandi e bottoni
 # --------------------------------------------------------------------------
 
 async def do_join(update, context, match, user, query=None):
     if match["status"] != "open":
-        return await _reply(update, query, "Questa partita è stata annullata.")
+        return await _reply(update, context, query, "Questa partita è stata annullata.", private=True)
 
     esito = core.join(match["id"], user.id, display_name(user))
     updated = core.get_match(match["id"])
     await refresh_card(context, updated)
 
     if esito == "gia_iscritto":
-        return await _reply(update, query, "Sei già iscritto 😉", alert=False)
+        return await _reply(update, context, query, "Sei già iscritto 😉", alert=False, private=True)
     if esito == "riserva":
         return await _reply(
-            update, query,
+            update, context, query,
             "Sei in lista riserve — entri se qualcuno si ritira.",
         )
-    return await _reply(update, query, "Dentro! ⚽")
+    return await _reply(update, context, query, "Dentro! ⚽")
 
 
 async def do_leave(update, context, match, user, query=None):
-    rimosso, promosso = core.leave(match["id"], user.id)
+    rimosso, promossi, ospiti_tolti = core.leave(match["id"], user.id)
     if not rimosso:
-        return await _reply(update, query, "Non risultavi iscritto.", alert=False)
+        return await _reply(update, context, query, "Non risultavi iscritto.", alert=False, private=True)
 
     updated = core.get_match(match["id"])
     await refresh_card(context, updated)
 
-    if promosso:
+    con_amici = ""
+    if ospiti_tolti:
+        con_amici = f" con {ospiti_tolti} amico" if ospiti_tolti == 1 else f" con {ospiti_tolti} amici"
+
+    if promossi:
+        entrano = ", ".join(esc(p["label"]) for p in promossi)
+        verbo = "entrano" if len(promossi) > 1 else "entra"
         await context.bot.send_message(
             chat_id=match["chat_id"],
-            text=f"🔄 {esc(display_name(user))} si ritira, entra {esc(promosso['name'])}.",
+            text=f"🔄 {esc(display_name(user))} si ritira{con_amici}, {verbo} {entrano}.",
             parse_mode=ParseMode.HTML,
         )
-    return await _reply(update, query, "Ti ho tolto dalla lista.")
+
+    coda = f" Ho tolto anche{con_amici.replace(' con', '')}." if ospiti_tolti else ""
+    return await _reply(update, context, query, f"Ti ho tolto dalla lista.{coda}")
 
 
 async def do_teams(update, context, match, user, query=None):
     if user.id != match["organizer_id"]:
         return await _reply(
-            update, query,
+            update, context, query,
             f"Solo {match['organizer_name']} può fare le squadre.",
+            private=True,
         )
 
     signups = core.get_signups(match["id"])
     starters, _ = core.split_roster(match, signups)
     if len(starters) < 2:
-        return await _reply(update, query, "Servono almeno 2 giocatori.")
+        return await _reply(update, context, query, "Servono almeno 2 giocatori.", private=True)
 
-    team_a, team_b = core.make_teams([s["name"] for s in starters])
+    team_a, team_b = core.make_teams([s["label"] for s in starters])
     core.update_match(match["id"], teams="|".join(team_a) + "||" + "|".join(team_b))
 
     updated = core.get_match(match["id"])
@@ -567,20 +708,109 @@ async def do_teams(update, context, match, user, query=None):
             text=f"🎽 Squadre fatte in {len(starters)} (ne mancavano "
                  f"{match['max_players'] - len(starters)}).",
         )
-    return await _reply(update, query, "Squadre fatte 🎽")
+    return await _reply(update, context, query, "Squadre fatte 🎽")
 
 
-async def _reply(update, query, text, alert=True):
-    """Risponde via popup se arriva da un bottone, via messaggio se da comando."""
+async def do_amico(update, context, match, user, query=None):
+    """Aggiunge un ospite a nome di chi preme."""
+    if match["status"] != "open":
+        return await _reply(update, context, query,
+                            "Questa partita è stata annullata.", private=True)
+
+    iscritti = core.get_signups(match["id"])
+    if not any(s["user_id"] == user.id and s["guest_of"] is None for s in iscritti):
+        return await _reply(
+            update, context, query,
+            "Prima iscriviti tu, poi puoi portare chi vuoi.", private=True,
+        )
+
+    esito = core.add_guest(match["id"], user.id, display_name(user))
+    await refresh_card(context, core.get_match(match["id"]))
+    if esito == "riserva":
+        return await _reply(update, context, query,
+                            "Il tuo amico è in lista riserve.")
+    return await _reply(update, context, query, "Amico aggiunto ⚽")
+
+
+async def do_togli_amico(update, context, match, user, query=None):
+    """
+    Toglie un ospite. Chi l'ha portato può togliere i suoi; l'organizzatore
+    della partita e gli amministratori del gruppo possono togliere chiunque.
+    Con un solo candidato lo rimuove subito, con più di uno chiede quale.
+    """
+    ospiti = [s for s in core.get_signups(match["id"]) if s["guest_of"] is not None]
+    if not ospiti:
+        return await _reply(update, context, query,
+                            "Non c'è nessun amico in lista.", private=True)
+
+    tutti = user.id == match["organizer_id"] or await is_group_admin(
+        context, match["chat_id"], user.id
+    )
+    candidati = ospiti if tutti else [s for s in ospiti if s["guest_of"] == user.id]
+
+    if not candidati:
+        return await _reply(update, context, query,
+                            "Puoi togliere solo gli amici che hai portato tu.",
+                            private=True)
+    if len(candidati) == 1:
+        return await _rimuovi_ospite(update, context, match, candidati[0], query)
+
+    tastiera = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"❌ {s['label']}", callback_data=f"gdel:{match['id']}:{s['id']}"
+        )]
+        for s in candidati
+    ])
+    if query:
+        await query.answer()
+    await notify(
+        update, context, "Chi tolgo?",
+        keyboard=tastiera, drop_command=query is None,
+    )
+
+
+async def _rimuovi_ospite(update, context, match, ospite, query=None):
+    etichetta = ospite["label"]
+    _, promosso = core.remove_guest(match["id"], ospite["id"])
+    await refresh_card(context, core.get_match(match["id"]))
+
+    if promosso:
+        # Non uso l'etichetta di chi esce: gli amici si rinumerano subito dopo la
+        # rimozione, e «esce Amico 1, entra Amico 2» sarebbe solo confondente.
+        await context.bot.send_message(
+            chat_id=match["chat_id"],
+            text=f"🔄 Esce un amico di {esc(ospite['name'])}, "
+                 f"entra {esc(promosso['label'])}.",
+            parse_mode=ParseMode.HTML,
+        )
+    return await _reply(update, context, query, f"Tolto: {etichetta}")
+
+
+async def _reply(update, context, query, text, alert=True, private=False):
+    """
+    Popup se l'azione arriva da un bottone, messaggio se arriva da un comando.
+
+    Con private=True l'avviso da comando passa da notify(): va in chat privata
+    o si autocancella, invece di restare a ingombrare il gruppo. I popup dei
+    bottoni sono già visibili solo a chi ha premuto.
+    """
     if query:
         await query.answer(text, show_alert=alert)
+    elif private:
+        await notify(update, context, text)
     else:
         await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    action, _, match_id = query.data.partition(":")
+    action, _, payload = query.data.partition(":")
+
+    if action == "gdel":
+        await on_guest_delete(update, context, payload, query)
+        return
+
+    match_id = payload
     match = core.get_match(match_id)
 
     if not match:
@@ -594,8 +824,46 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await do_leave(update, context, match, user, query)
     elif action == "teams":
         await do_teams(update, context, match, user, query)
+    elif action == "guest":
+        await do_amico(update, context, match, user, query)
+    elif action == "unguest":
+        await do_togli_amico(update, context, match, user, query)
     else:
         await query.answer()
+
+
+async def on_guest_delete(update, context, payload, query):
+    """❌ premuto nell'elenco «Chi tolgo?»."""
+    match_id, _, signup_id = payload.partition(":")
+    match = core.get_match(match_id)
+    if not match:
+        await query.answer("Partita non trovata.", show_alert=True)
+        return
+
+    user = query.from_user
+    ospite = next(
+        (s for s in core.get_signups(match["id"])
+         if str(s["id"]) == signup_id and s["guest_of"] is not None),
+        None,
+    )
+    if not ospite:
+        await query.answer("Quell'amico non c'è più.", show_alert=True)
+        return
+
+    if not (user.id == ospite["guest_of"]
+            or user.id == match["organizer_id"]
+            or await is_group_admin(context, match["chat_id"], user.id)):
+        await query.answer("Puoi togliere solo gli amici che hai portato tu.",
+                           show_alert=True)
+        return
+
+    etichetta = ospite["label"]
+    await _rimuovi_ospite(update, context, match, ospite, query)
+    try:
+        await query.edit_message_text(f"Tolto: {esc(etichetta)}",
+                                      parse_mode=ParseMode.HTML)
+    except BadRequest:
+        pass
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -629,7 +897,11 @@ def main():
     app.add_handler(CommandHandler("modifica", cmd_modifica))
     app.add_handler(CommandHandler(["annulla", "cancella_partita"], cmd_annulla))
     app.add_handler(CommandHandler(["elimina", "elimina_partita"], cmd_elimina))
+    app.add_handler(CommandHandler(["amico", "porto_un_amico"], cmd_amico))
+    app.add_handler(CommandHandler(["togli_amico", "tolgo_un_amico"], cmd_togli_amico))
     app.add_handler(CallbackQueryHandler(on_button))
+    # Per ultimo: raccoglie tutti i comandi che nessun handler sopra ha preso.
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_sconosciuto))
     app.add_error_handler(on_error)
 
     if WEBHOOK_URL:

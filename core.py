@@ -25,6 +25,18 @@ def get_db():
     return conn
 
 
+SIGNUPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS signups (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id  TEXT NOT NULL,
+    user_id   INTEGER NOT NULL,   -- chi occupa il posto; per un ospite, chi l'ha portato
+    name      TEXT NOT NULL,
+    guest_of  INTEGER,            -- NULL = giocatore vero, altrimenti chi l'ha aggiunto
+    joined_at TEXT NOT NULL
+);
+"""
+
+
 def init_db():
     with get_db() as conn:
         conn.executescript("""
@@ -41,16 +53,34 @@ def init_db():
             teams          TEXT,
             created_at     TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS signups (
-            match_id  TEXT NOT NULL,
-            user_id   INTEGER NOT NULL,
-            name      TEXT NOT NULL,
-            joined_at TEXT NOT NULL,
-            PRIMARY KEY (match_id, user_id)
-        );
+        """ + SIGNUPS_SCHEMA)
+
+        _migra_ospiti(conn)
+
+        conn.executescript("""
         CREATE INDEX IF NOT EXISTS idx_signups_match ON signups(match_id);
         CREATE INDEX IF NOT EXISTS idx_matches_chat  ON matches(chat_id, status);
+        -- un giocatore vero si iscrive una volta sola; gli ospiti no, sono più d'uno
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_signups_player
+            ON signups(match_id, user_id) WHERE guest_of IS NULL;
         """)
+
+
+def _migra_ospiti(conn):
+    """
+    Porta la vecchia tabella signups (una riga per giocatore, nessun ospite)
+    al nuovo schema, conservando le iscrizioni già raccolte.
+    """
+    colonne = [r[1] for r in conn.execute("PRAGMA table_info(signups)")]
+    if not colonne or "guest_of" in colonne:
+        return
+    conn.executescript("""
+        ALTER TABLE signups RENAME TO signups_old;
+        """ + SIGNUPS_SCHEMA + """
+        INSERT INTO signups (match_id, user_id, name, guest_of, joined_at)
+            SELECT match_id, user_id, name, NULL, joined_at FROM signups_old;
+        DROP TABLE signups_old;
+    """)
 
 
 # --------------------------------------------------------------------------
@@ -271,11 +301,80 @@ def expired_matches(hours: int = 3):
 # --------------------------------------------------------------------------
 
 def get_signups(match_id: str):
+    """
+    Iscritti in ordine di arrivo, come dizionari con in più 'label': il nome da
+    mostrare. Per un ospite è «Amico 2 di Lorenzo», e la numerazione si ricalcola
+    a ogni lettura, così dopo una rimozione non restano buchi.
+    """
     with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM signups WHERE match_id = ? ORDER BY joined_at",
+        righe = conn.execute(
+            "SELECT * FROM signups WHERE match_id = ? ORDER BY joined_at, id",
             (match_id,),
         ).fetchall()
+
+    iscritti, contatori = [], {}
+    for r in righe:
+        d = dict(r)
+        if d["guest_of"] is None:
+            d["label"] = d["name"]
+        else:
+            n = contatori.get(d["guest_of"], 0) + 1
+            contatori[d["guest_of"]] = n
+            d["label"] = f"Amico {n} di {d['name']}"
+        iscritti.append(d)
+    return iscritti
+
+
+def guests_of(match_id: str, user_id: int):
+    """Gli ospiti portati da una certa persona."""
+    return [s for s in get_signups(match_id) if s["guest_of"] == user_id]
+
+
+def add_guest(match_id: str, user_id: int, adder_name: str) -> str:
+    """Aggiunge un ospite. Ritorna 'in' o 'riserva'."""
+    prima = get_signups(match_id)
+    match = get_match(match_id)
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO signups (match_id, user_id, name, guest_of, joined_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (match_id, user_id, adder_name, user_id, datetime.now(TZ).isoformat()),
+        )
+    return "in" if len(prima) < match["max_players"] else "riserva"
+
+
+def _rimuovi_riga(match, prima, row_id):
+    """
+    Cancella una riga di iscrizione e ritorna la riserva che entra al suo posto
+    (None se non ce n'erano, o se il posto liberato era già in panchina).
+    """
+    era_titolare = any(s["id"] == row_id for s in prima[: match["max_players"]])
+    c_erano_riserve = len(prima) > match["max_players"]
+
+    with get_db() as conn:
+        conn.execute("DELETE FROM signups WHERE id = ?", (row_id,))
+
+    if era_titolare and c_erano_riserve:
+        dopo = get_signups(match["id"])
+        return dopo[match["max_players"] - 1]
+    return None
+
+
+def remove_guest(match_id: str, signup_id: int):
+    """
+    Toglie un ospite. Ritorna (ospite_rimosso | None, promosso | None):
+    None come primo elemento significa che quella riga non esiste più.
+    """
+    match = get_match(match_id)
+    prima = get_signups(match_id)
+    ospite = next(
+        (s for s in prima
+         if s["id"] == int(signup_id) and s["guest_of"] is not None),
+        None,
+    )
+    if not ospite:
+        return None, None
+    return ospite, _rimuovi_riga(match, prima, ospite["id"])
 
 
 def split_roster(match, signups):
@@ -289,7 +388,7 @@ def join(match_id: str, user_id: int, name: str) -> str:
     match = get_match(match_id)
     signups = get_signups(match_id)
 
-    if any(s["user_id"] == user_id for s in signups):
+    if any(s["user_id"] == user_id and s["guest_of"] is None for s in signups):
         return "gia_iscritto"
 
     with get_db() as conn:
@@ -302,31 +401,27 @@ def join(match_id: str, user_id: int, name: str) -> str:
 
 def leave(match_id: str, user_id: int):
     """
-    Rimuove l'iscrizione. Ritorna (rimosso: bool, promosso: row|None)
-    dove 'promosso' è la prima riserva che entra tra i titolari.
+    Ritira una persona e con lei gli amici che aveva portato: erano suoi ospiti,
+    senza di lei quei posti tornano liberi per gli altri.
+
+    Ritorna (rimosso: bool, promossi: list, ospiti_tolti: int).
     """
     match = get_match(match_id)
-    before = get_signups(match_id)
-    if not any(s["user_id"] == user_id for s in before):
-        return False, None
+    prima = get_signups(match_id)
 
-    was_starter = any(
-        s["user_id"] == user_id for s in before[: match["max_players"]]
-    )
-    had_reserves = len(before) > match["max_players"]
+    miei = [s for s in prima if s["user_id"] == user_id]
+    if not any(s["guest_of"] is None for s in miei):
+        return False, [], 0
 
-    with get_db() as conn:
-        conn.execute(
-            "DELETE FROM signups WHERE match_id = ? AND user_id = ?",
-            (match_id, user_id),
-        )
+    ospiti_tolti = len(miei) - 1
+    promossi = []
+    # dall'ultimo arrivato al primo: così gli indici delle riserve restano sani
+    for riga in sorted(miei, key=lambda s: s["joined_at"], reverse=True):
+        promosso = _rimuovi_riga(match, get_signups(match_id), riga["id"])
+        if promosso:
+            promossi.append(promosso)
 
-    promosso = None
-    if was_starter and had_reserves:
-        after = get_signups(match_id)
-        promosso = after[match["max_players"] - 1]
-
-    return True, promosso
+    return True, promossi, ospiti_tolti
 
 
 # --------------------------------------------------------------------------

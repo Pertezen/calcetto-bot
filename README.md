@@ -14,13 +14,15 @@ partita, gli altri si iscrivono con un bottone, l'organizzatore fa le squadre.
 | `/esco ID` | iscritti | si ritira; la prima riserva entra da sola |
 | `/lista ID` | chiunque | ristampa la scheda della partita |
 | `/partite` | chiunque | tutte le partite aperte del gruppo |
+| `/amico ID` | iscritti | porta un amico: in lista appare «Amico 1 di Mario» |
+| `/togli_amico ID` | chi l'ha portato, organizzatore, admin | toglie un amico dalla lista |
 | `/squadre ID` | organizzatore | divide i titolari in Bianchi e Rossi |
 | `/modifica ID ora\|posto\|posti valore` | organizzatore | cambia i dati |
 | `/annulla ID` | organizzatore | annulla la partita, la scheda resta come promemoria |
 | `/elimina ID` | organizzatore | la cancella del tutto: partita, iscritti e scheda |
 
-Sotto ogni partita ci sono i bottoni **✅ Ci sono / 🚪 Mi ritiro / 🎽 Fai le
-squadre**: nella pratica i comandi non li userà quasi nessuno, si preme e basta.
+Sotto ogni partita ci sono i bottoni **✅ Ci sono / 🚪 Mi ritiro / ➕ Porto un
+amico / ➖ Tolgo un amico / 🎽 Fai le squadre**: nella pratica i comandi non li userà quasi nessuno, si preme e basta.
 La scheda si aggiorna da sola a ogni iscrizione.
 
 Se nel gruppo c'è una sola partita aperta, l'ID puoi anche non scriverlo.
@@ -32,6 +34,13 @@ Se nel gruppo c'è una sola partita aperta, l'ID puoi anche non scriverlo.
 sola — riga nel database e scheda nel gruppo. Nessun comando da dare, nessuna
 lista che si allunga all'infinito. Si cambia con la variabile
 `PURGE_AFTER_HOURS`.
+
+**Amici (+1):** chi è iscritto può portare quanti amici vuole, che in lista
+compaiono come «Amico 1 di Mario». Occupano un posto come tutti, riserve
+comprese. Li può togliere chi li ha portati, l'organizzatore della partita o un
+amministratore del gruppo; se chi li ha portati si ritira, se ne vanno con lui —
+erano suoi ospiti, e quei posti tornano liberi per gli altri. La numerazione si
+ricompatta a ogni rimozione, così non restano buchi.
 
 **Extra rispetto alla spec:** lista riserve automatica. Se la partita è piena
 l'undicesimo finisce in riserva, e se qualcuno molla entra al suo posto con un
@@ -102,8 +111,15 @@ qui in poi il tuo PC può stare spento.
 
 1. Apri il gruppo del calcetto → **Aggiungi membri** → cerca il tuo bot
 2. Scrivi `/start` per vedere l'aiuto
-3. Facoltativo: rendilo **amministratore** con il solo permesso di *pin dei
-   messaggi*, così fissa in alto la partita del momento
+3. Rendilo **amministratore** con due permessi: *fissare i messaggi* (tiene in
+   alto la partita del momento) ed *eliminare i messaggi* (gli serve per far
+   sparire i comandi sbagliati insieme ai relativi avvisi)
+
+**Avvisi ed errori** non finiscono nel gruppo: il bot li manda in chat privata a
+chi ha sbagliato. Se quella persona non ha mai aperto una chat col bot — Telegram
+non permette al bot di scrivere per primo — l'avviso compare nel gruppo con la
+sua menzione e si autocancella dopo 25 secondi. Chi scrive un comando inesistente
+riceve il suggerimento di quello giusto (`/iscrivi` → `/iscrivimi`).
 
 ### 6 · Menù comandi (facoltativo, ma fa la differenza)
 
@@ -119,6 +135,8 @@ squadre - Dividi le squadre
 modifica - Cambia ora, posto o posti
 annulla - Annulla la partita
 elimina - Cancella la partita del tutto
+amico - Porti un amico
+togli_amico - Togli un amico
 ```
 
 Così i comandi compaiono nel menù ⌘ della chat e nessuno deve ricordarseli.
