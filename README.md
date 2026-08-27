@@ -16,7 +16,7 @@ partita, gli altri si iscrivono con un bottone, l'organizzatore fa le squadre.
 | `/partite` | chiunque | tutte le partite aperte del gruppo |
 | `/amico ID` | iscritti | porta un amico: in lista appare «Amico 1 di Mario» |
 | `/togli_amico ID` | chi l'ha portato, organizzatore, admin | toglie un amico dalla lista |
-| `/squadre ID` | organizzatore | divide i titolari in Bianchi e Rossi |
+| `/squadre ID` | organizzatore, admin | divide i titolari in Bianchi e Neri: a caso o scegliendoli a mano |
 | `/modifica ID ora\|posto\|posti valore` | organizzatore | cambia i dati |
 | `/annulla ID` | organizzatore | annulla la partita, la scheda resta come promemoria |
 | `/elimina ID` | organizzatore | la cancella del tutto: partita, iscritti e scheda |
@@ -41,6 +41,11 @@ comprese. Li può togliere chi li ha portati, l'organizzatore della partita o un
 amministratore del gruppo; se chi li ha portati si ritira, se ne vanno con lui —
 erano suoi ospiti, e quei posti tornano liberi per gli altri. La numerazione si
 ricompatta a ogni rimozione, così non restano buchi.
+
+**Squadre:** premendo 🎽 si sceglie fra sorteggio e composizione manuale. Nel
+secondo caso il bot propone una divisione a caso e la si aggiusta toccando i
+nomi: chi è ⚪ va coi Bianchi, gli altri sono i Neri. La selezione vive nei
+bottoni del messaggio, quindi sopravvive a un riavvio del bot.
 
 **Extra rispetto alla spec:** lista riserve automatica. Se la partita è piena
 l'undicesimo finisce in riserva, e se qualcuno molla entra al suo posto con un

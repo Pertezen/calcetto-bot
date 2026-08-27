@@ -6,6 +6,7 @@ Avvio: python bot.py
 import asyncio
 import difflib
 import html
+import random
 import logging
 import os
 
@@ -68,7 +69,7 @@ HELP = """⚽ <b>Bot Calcetto</b>
 /esco <code>ID</code> — ti ritiri
 /amico <code>ID</code> — porti un amico (quanti vuoi)
 /togli_amico <code>ID</code> — ne togli uno
-/squadre <code>ID</code> — divide le squadre (solo organizzatore)
+/squadre <code>ID</code> — squadre a caso o scelte a mano (organizzatore e admin)
 /modifica <code>ID ora|posto|posti valore</code>
 /annulla <code>ID</code> — annulla la partita, la scheda resta
 /elimina <code>ID</code> — la cancella del tutto (solo organizzatore)
@@ -128,7 +129,7 @@ def render_card(match) -> tuple[str, InlineKeyboardMarkup | None]:
             "⚪ <b>Bianchi</b>",
             *(f"· {esc(n)}" for n in team_a.split("|") if n),
             "",
-            "🔴 <b>Rossi</b>",
+            "⚫ <b>Neri</b>",
             *(f"· {esc(n)}" for n in team_b.split("|") if n),
         ]
 
@@ -689,32 +690,185 @@ async def do_leave(update, context, match, user, query=None):
     return await _reply(update, context, query, f"Ti ho tolto dalla lista.{coda}")
 
 
-async def do_teams(update, context, match, user, query=None):
-    if user.id != match["organizer_id"]:
-        return await _reply(
-            update, context, query,
-            f"Solo {match['organizer_name']} può fare le squadre.",
-            private=True,
-        )
+async def puo_squadre(context, match, user_id) -> bool:
+    """Le squadre le fa l'organizzatore, o un amministratore del gruppo."""
+    return user_id == match["organizer_id"] or await is_group_admin(
+        context, match["chat_id"], user_id
+    )
 
-    signups = core.get_signups(match["id"])
-    starters, _ = core.split_roster(match, signups)
-    if len(starters) < 2:
-        return await _reply(update, context, query, "Servono almeno 2 giocatori.", private=True)
 
-    team_a, team_b = core.make_teams([s["label"] for s in starters])
-    core.update_match(match["id"], teams="|".join(team_a) + "||" + "|".join(team_b))
+def titolari(match):
+    return core.split_roster(match, core.get_signups(match["id"]))[0]
 
-    updated = core.get_match(match["id"])
-    await refresh_card(context, updated)
 
-    if len(starters) < match["max_players"]:
+def _pulisci(label: str) -> str:
+    """Il carattere | separa le squadre nel database: fuori dai nomi."""
+    return label.replace("|", "/")
+
+
+def _sorteggio(starters):
+    """Una divisione a caso, come punto di partenza: ritorna gli id dei Bianchi."""
+    pool = list(starters)
+    random.shuffle(pool)
+    return {s["id"] for s in pool[: (len(pool) + 1) // 2]}
+
+
+def picker_text(starters, bianchi_ids) -> str:
+    b = sum(1 for s in starters if s["id"] in bianchi_ids)
+    return (
+        "🎽 <b>Scegli i Bianchi</b>\n"
+        "Tocca un nome per spostarlo di squadra: chi resta fuori gioca coi Neri.\n\n"
+        f"⚪ Bianchi <b>{b}</b>  ·  ⚫ Neri <b>{len(starters) - b}</b>"
+    )
+
+
+def picker_keyboard(match_id, starters, bianchi_ids) -> InlineKeyboardMarkup:
+    righe = [
+        [InlineKeyboardButton(
+            f"{'⚪' if s['id'] in bianchi_ids else '⚫'} {s['label']}",
+            callback_data=f"pick:{match_id}:{s['id']}",
+        )]
+        for s in starters
+    ]
+    righe.append([
+        InlineKeyboardButton("🎲 Rimescola", callback_data=f"tshuf:{match_id}"),
+        InlineKeyboardButton("✅ Conferma", callback_data=f"pickok:{match_id}"),
+    ])
+    return InlineKeyboardMarkup(righe)
+
+
+def bianchi_dal_messaggio(query) -> set:
+    """
+    Ricava la selezione dai bottoni del messaggio stesso: nessuno stato da
+    tenere in memoria, e la scelta sopravvive a un riavvio del bot.
+    """
+    scelti = set()
+    markup = getattr(query.message, "reply_markup", None)
+    for riga in getattr(markup, "inline_keyboard", []) or []:
+        for bottone in riga:
+            dati = bottone.callback_data or ""
+            if dati.startswith("pick:") and bottone.text.startswith("⚪"):
+                scelti.add(int(dati.rsplit(":", 1)[1]))
+    return scelti
+
+
+async def salva_squadre(context, match, bianchi, neri, query=None, update=None):
+    core.update_match(
+        match["id"],
+        teams="|".join(_pulisci(s["label"]) for s in bianchi)
+              + "||"
+              + "|".join(_pulisci(s["label"]) for s in neri),
+    )
+    await refresh_card(context, core.get_match(match["id"]))
+
+    if len(bianchi) + len(neri) < match["max_players"]:
+        mancavano = match["max_players"] - len(bianchi) - len(neri)
         await context.bot.send_message(
             chat_id=match["chat_id"],
-            text=f"🎽 Squadre fatte in {len(starters)} (ne mancavano "
-                 f"{match['max_players'] - len(starters)}).",
+            text=f"🎽 Squadre fatte in {len(bianchi) + len(neri)} "
+                 f"(ne mancavano {mancavano}).",
         )
-    return await _reply(update, context, query, "Squadre fatte 🎽")
+
+    riepilogo = (
+        "🎽 <b>Squadre fatte</b>\n\n"
+        "⚪ <b>Bianchi</b>: " + ", ".join(esc(s["label"]) for s in bianchi) + "\n"
+        "⚫ <b>Neri</b>: " + ", ".join(esc(s["label"]) for s in neri)
+    )
+    if query:
+        try:
+            await query.edit_message_text(riepilogo, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            pass
+
+
+async def do_teams(update, context, match, user, query=None):
+    """Apre il menù: sorteggio o scelta a mano."""
+    if not await puo_squadre(context, match, user.id):
+        return await _reply(
+            update, context, query,
+            f"Solo {match['organizer_name']} o un amministratore "
+            f"può fare le squadre.",
+            private=True,
+        )
+    if len(titolari(match)) < 2:
+        return await _reply(update, context, query,
+                            "Servono almeno 2 giocatori.", private=True)
+
+    tastiera = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎲 A caso", callback_data=f"trand:{match['id']}"),
+        InlineKeyboardButton("✋ Scelgo io", callback_data=f"tpick:{match['id']}"),
+    ]])
+    if query:
+        await query.answer()
+    await notify(
+        update, context, "Come le faccio, le squadre?",
+        keyboard=tastiera, drop_command=query is None, seconds=180,
+    )
+
+
+async def on_teams_button(update, context, action, payload, query):
+    """Tutti i bottoni della composizione squadre."""
+    match_id, _, extra = payload.partition(":")
+    match = core.get_match(match_id)
+    if not match:
+        await query.answer("Partita non trovata.", show_alert=True)
+        return
+    if not await puo_squadre(context, match, query.from_user.id):
+        await query.answer("Le squadre le fa l'organizzatore.", show_alert=True)
+        return
+
+    starters = titolari(match)
+    if len(starters) < 2:
+        await query.answer("Servono almeno 2 giocatori.", show_alert=True)
+        return
+
+    if action == "trand":
+        # Divido per id e non per nome: due persone possono chiamarsi uguale.
+        bianchi_ids = _sorteggio(starters)
+        bianchi = [s for s in starters if s["id"] in bianchi_ids]
+        neri = [s for s in starters if s["id"] not in bianchi_ids]
+        await query.answer("Sorteggiate 🎲")
+        await salva_squadre(context, match, bianchi, neri, query)
+        return
+
+    if action in ("tpick", "tshuf"):
+        bianchi_ids = _sorteggio(starters)
+        await query.answer("Rimescolate 🎲" if action == "tshuf" else None)
+        try:
+            await query.edit_message_text(
+                picker_text(starters, bianchi_ids),
+                reply_markup=picker_keyboard(match["id"], starters, bianchi_ids),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+        return
+
+    if action == "pick":
+        bianchi_ids = bianchi_dal_messaggio(query)
+        scelto = int(extra)
+        bianchi_ids.symmetric_difference_update({scelto})
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                picker_text(starters, bianchi_ids),
+                reply_markup=picker_keyboard(match["id"], starters, bianchi_ids),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+        return
+
+    if action == "pickok":
+        bianchi_ids = bianchi_dal_messaggio(query)
+        bianchi = [s for s in starters if s["id"] in bianchi_ids]
+        neri = [s for s in starters if s["id"] not in bianchi_ids]
+        if not bianchi or not neri:
+            await query.answer("Una squadra è vuota: sposta qualcuno.",
+                               show_alert=True)
+            return
+        await query.answer("Squadre fatte 🎽")
+        await salva_squadre(context, match, bianchi, neri, query)
 
 
 async def do_amico(update, context, match, user, query=None):
@@ -814,6 +968,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "gdel":
         await on_guest_delete(update, context, payload, query)
+        return
+
+    if action in ("trand", "tpick", "tshuf", "pick", "pickok"):
+        await on_teams_button(update, context, action, payload, query)
         return
 
     match_id = payload
